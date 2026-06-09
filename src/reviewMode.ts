@@ -145,15 +145,36 @@ export function shouldBlockSupabaseMutation({
   return url.pathname.includes('/rest/v1/')
 }
 
-export function normalizeReviewRedirectPath(value: string | null | undefined) {
-  if (!value || !value.startsWith('/')) return '/dashboard'
-  if (value.startsWith('//')) return '/dashboard'
-  if (value === '/') return '/dashboard'
+/**
+ * Open-redirect guard for a post-auth redirect path. Returns `fallback`
+ * (default '/dashboard') for empty/unsafe values: anything that isn't a
+ * single-leading-slash same-origin path (rejects protocol-relative `//host`,
+ * non-`/` absolute URLs, and the bare `/` root). The optional `fallback` lets
+ * a consuming app point unsafe values at its own landing path instead of the
+ * package default — pass it `landingPath`.
+ */
+export function normalizeReviewRedirectPath(
+  value: string | null | undefined,
+  fallback = '/dashboard',
+) {
+  if (!value || !value.startsWith('/')) return fallback
+  if (value.startsWith('//')) return fallback
+  if (value === '/') return fallback
   return value
 }
 
-export function appendReviewToken(path: string, token: string, origin: string) {
-  const url = new URL(normalizeReviewRedirectPath(path), origin)
+/**
+ * Re-append `review_token` onto a (normalized) redirect path so review mode
+ * stays active after the reviewer lands. The optional `fallback` is forwarded
+ * to `normalizeReviewRedirectPath` (default '/dashboard').
+ */
+export function appendReviewToken(
+  path: string,
+  token: string,
+  origin: string,
+  fallback = '/dashboard',
+) {
+  const url = new URL(normalizeReviewRedirectPath(path, fallback), origin)
   url.searchParams.set('review_token', token)
   return url
 }
@@ -161,6 +182,59 @@ export function appendReviewToken(path: string, token: string, origin: string) {
 export function dispatchReviewReadOnlyEvent() {
   if (typeof window === 'undefined') return
   window.dispatchEvent(new CustomEvent(REVIEW_MODE_BLOCKED_EVENT))
+}
+
+/**
+ * True when a fetch Response is the uniform reviewer-blocked 403: HTTP 403 with
+ * the `x-reviewer-read-only` header set. Matches the response produced by
+ * `reviewerBlockedJsonResponse()` / `createReviewBlockedResponse()`.
+ */
+export function isReviewerBlockedResponse(res: Response | null | undefined): boolean {
+  if (!res) return false
+  return res.status === 403 && res.headers.get(REVIEWER_BLOCKED_HEADER) != null
+}
+
+/**
+ * Wrap `win.fetch` so that any reviewer-blocked 403 (see
+ * `isReviewerBlockedResponse`) auto-fires the read-only event — which
+ * `ReviewModeClient` turns into the read-only toast. This means a consuming app
+ * gets the toast for free on blocked mutations without threading the response
+ * through its own handlers.
+ *
+ * No-op (returns a no-op cleanup) when there is no `fetch` to wrap (e.g. SSR).
+ * Returns a cleanup that restores the original fetch. The wrapper never
+ * swallows errors or alters the response — it only observes status/header and
+ * passes the original Response (or rejection) straight through.
+ */
+type PatchedFetch = typeof fetch & { __reviewBlockedFetchPatched?: true }
+
+export function installReviewBlockedFetchInterceptor(
+  win: ReviewWindow = window,
+): () => void {
+  if (!win || typeof win.fetch !== 'function') return () => {}
+  const originalFetch = win.fetch as PatchedFetch
+  // Mark our wrapper so a double-install is idempotent (and a stale cleanup
+  // from a previous mount can't clobber a newer wrapper).
+  if (originalFetch.__reviewBlockedFetchPatched) return () => {}
+
+  const wrapped = async function reviewBlockedFetch(
+    this: unknown,
+    ...args: Parameters<typeof fetch>
+  ): Promise<Response> {
+    const res = await originalFetch.apply(this, args)
+    try {
+      if (isReviewerBlockedResponse(res)) dispatchReviewReadOnlyEvent()
+    } catch { /* never let the toast hook break the request */ }
+    return res
+  } as PatchedFetch
+  wrapped.__reviewBlockedFetchPatched = true
+  win.fetch = wrapped
+
+  return () => {
+    // Only restore if we're still the active wrapper (avoid clobbering a newer
+    // interceptor installed after us).
+    if (win.fetch === wrapped) win.fetch = originalFetch
+  }
 }
 
 export function createReviewBlockedResponse() {

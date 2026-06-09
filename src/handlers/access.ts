@@ -9,7 +9,12 @@
  *   1. Validates the token against the DRVR dashboard (using config.project
  *      + config.dashboardUrl).
  *   2. If the user is already signed in with the right email → grant
- *      reviewer role → redirect to config.landingPath (default '/dashboard').
+ *      reviewer role → redirect to the success target. The target is
+ *      config.landingPath (default '/dashboard'); if config.honorNext and the
+ *      request carries a same-origin-safe `?next=`, that path is used instead.
+ *      If config.reappendToken, `review_token` is re-appended to the target so
+ *      review mode stays on. If config.markerCookie, that durable cross-site
+ *      marker cookie is set on the redirect.
  *   3. If no session or wrong email → redirect to /review/auth with the
  *      token preserved.
  *   4. If no client_email on the minted review (legacy shared-reviewer flow)
@@ -28,6 +33,10 @@ import {
   reviewCookieOptions,
   type ReviewConfig,
 } from '../reviewerServer'
+import {
+  appendReviewToken,
+  normalizeReviewRedirectPath,
+} from '../reviewMode'
 
 function getExternalOrigin(request: NextRequest): string {
   const proto = request.headers.get('x-forwarded-proto') ?? 'https'
@@ -45,6 +54,7 @@ export async function handleReviewAccess(
   const landingPath = config.landingPath ?? '/dashboard'
   const { searchParams } = request.nextUrl
   const token = searchParams.get('review_token') ?? ''
+  const nextParam = searchParams.get('next')
 
   if (!token) {
     return NextResponse.redirect(new URL('/review/error', getExternalOrigin(request)))
@@ -85,7 +95,44 @@ export async function handleReviewAccess(
     const emailOk = !clientEmail || userEmail === clientEmail
     if (emailOk) {
       await ensureReviewerRole(user.id)
-      return NextResponse.redirect(new URL(landingPath, getExternalOrigin(request)))
+
+      const origin = getExternalOrigin(request)
+
+      // Success target. `landingPath` is operator-controlled, so it's used
+      // verbatim (preserving the original default behavior). Only the untrusted
+      // `next` param is run through normalizeReviewRedirectPath, which rejects
+      // `//host`, non-`/`, and bare `/`, falling back to landingPath.
+      const target =
+        config.honorNext && nextParam
+          ? normalizeReviewRedirectPath(nextParam, landingPath)
+          : landingPath
+
+      // Build the redirect URL, optionally re-appending review_token so review
+      // mode stays active after the reviewer lands.
+      const destination = config.reappendToken
+        ? appendReviewToken(target, token, origin, landingPath)
+        : new URL(target, origin)
+
+      const redirectResponse = NextResponse.redirect(destination)
+      // NextResponse.next() cookies don't transfer to a redirect — copy any
+      // auth cookies refreshed during getUser onto the redirect response.
+      for (const cookie of response.cookies.getAll()) {
+        redirectResponse.cookies.set(cookie)
+      }
+      // Durable cross-site marker so the app's Supabase clients keep emitting
+      // SameSite=None auth cookies for the rest of this reviewer session.
+      if (config.markerCookie) {
+        redirectResponse.cookies.set({
+          name: config.markerCookie,
+          value: '1',
+          sameSite: 'none',
+          secure: true,
+          httpOnly: false,
+          path: '/',
+          maxAge: 60 * 60 * 8,
+        })
+      }
+      return redirectResponse
     }
     // Wrong email — sign out and fall through to auth page.
     await supabase.auth.signOut()

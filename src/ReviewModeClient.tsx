@@ -15,6 +15,7 @@ import { useEffect, useRef, useState } from 'react'
 import { usePathname, useSearchParams } from 'next/navigation'
 import {
   enableReviewMode,
+  installReviewBlockedFetchInterceptor,
   installReviewRouteListeners,
   installReviewScrollBridge,
   isReviewModeEnabled,
@@ -25,22 +26,35 @@ import {
 
 const TOAST_DURATION_MS = 2600
 
+/** Default banner chip classes — the original orange "Review Session" chip. */
+const DEFAULT_BANNER_CLASS =
+  'rounded-full border border-orange-900/30 bg-orange-50/95 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-orange-900 shadow-lg backdrop-blur dark:border-orange-200/20 dark:bg-orange-950/90 dark:text-orange-100'
+
 export interface ReviewModeClientProps {
   /** Banner chip text. Default: 'Review Session · Read-only'. */
   bannerText?: string
   /** Read-only toast text. Default: the shared REVIEWER_READ_ONLY_MESSAGE. */
   readOnlyToastText?: string
   /**
-   * Extra classes merged onto the banner chip, for light theming (e.g.
-   * brand color overrides). Appended after the defaults so they win.
+   * Banner chip classes. When provided, this **fully replaces** the default
+   * chip styling (no merge) — so an app can rebrand the banner without fighting
+   * the defaults via `!important`. Leave unset to keep the original orange chip.
    */
   bannerClassName?: string
+  /**
+   * When true (default), install a `fetch` interceptor for the duration of the
+   * review session that auto-fires the read-only event (→ toast) on any
+   * reviewer-blocked 403 (`x-reviewer-read-only`). Set false to opt out (e.g.
+   * if the app installs its own interceptor or surfaces the toast another way).
+   */
+  interceptFetch?: boolean
 }
 
 export default function ReviewModeClient({
   bannerText = 'Review Session · Read-only',
   readOnlyToastText = REVIEWER_READ_ONLY_MESSAGE,
-  bannerClassName = '',
+  bannerClassName,
+  interceptFetch = true,
 }: ReviewModeClientProps = {}) {
   const pathname = usePathname()
   const searchParams = useSearchParams()
@@ -107,6 +121,16 @@ export default function ReviewModeClient({
     return installReviewScrollBridge(window)
   }, [reviewModeEnabled])
 
+  // Fetch interceptor: auto-fire the read-only event (→ toast) on any
+  // reviewer-blocked 403 so the app doesn't have to wire it per call site.
+  // Only active inside a review session, and only when opted in (default on).
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined
+    if (!interceptFetch) return undefined
+    if (!reviewModeEnabled) return undefined
+    return installReviewBlockedFetchInterceptor(window)
+  }, [interceptFetch, reviewModeEnabled])
+
   useEffect(() => {
     if (typeof window === 'undefined') return undefined
     function showToast() { setShowReadOnlyToast(true) }
@@ -125,12 +149,7 @@ export default function ReviewModeClient({
   return (
     <>
       <div className="pointer-events-none fixed right-4 top-4 z-[70]">
-        <div
-          className={[
-            'rounded-full border border-orange-900/30 bg-orange-50/95 px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.14em] text-orange-900 shadow-lg backdrop-blur dark:border-orange-200/20 dark:bg-orange-950/90 dark:text-orange-100',
-            bannerClassName,
-          ].join(' ').trim()}
-        >
+        <div className={bannerClassName ?? DEFAULT_BANNER_CLASS}>
           {bannerText}
         </div>
       </div>

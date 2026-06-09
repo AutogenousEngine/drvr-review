@@ -43,6 +43,30 @@ export type ReviewConfig = {
    * process.env.REVIEW_DASHBOARD_URL || DEFAULT_REVIEW_DASHBOARD_URL.
    */
   dashboardUrl?: string
+  /**
+   * Durable cross-site marker cookie. If set, `handleReviewAccess` sets
+   * `<markerCookie>=1` (SameSite=None; Secure; Path=/) on the authenticated
+   * success redirect. This is the non-auth signal that tells an app's Supabase
+   * clients / middleware to keep emitting SameSite=None auth cookies for the
+   * rest of the reviewer session so Chrome's third-party-cookie partitioning
+   * doesn't drop the session mid-review. Unset → no marker cookie (default).
+   * Example: 'wr_review'.
+   */
+  markerCookie?: string
+  /**
+   * If true, `handleReviewAccess` honors a same-origin-safe `?next=` param on
+   * the authenticated success redirect instead of always using `landingPath`.
+   * The `next` value is passed through `normalizeReviewRedirectPath`, so unsafe
+   * values (protocol-relative `//`, non-`/`, bare `/`) fall back to
+   * `landingPath`. Default false (always land on `landingPath`).
+   */
+  honorNext?: boolean
+  /**
+   * If true, `handleReviewAccess` appends `review_token=<token>` to the
+   * authenticated success redirect URL so review mode stays active after the
+   * reviewer lands. Default false.
+   */
+  reappendToken?: boolean
 }
 
 // ---------------------------------------------------------------------------

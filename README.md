@@ -42,7 +42,7 @@ Add it as a git dependency pinned to a tag, and tell Next to transpile it:
 // package.json
 {
   "dependencies": {
-    "@drvr/review": "github:AutogenousEngine/drvr-review#v0.1.0"
+    "@drvr/review": "github:AutogenousEngine/drvr-review#v0.2.0"
   }
 }
 ```
@@ -58,6 +58,15 @@ module.exports = nextConfig
 Peer deps (already present in a Next + Supabase app): `react`, `react-dom`,
 `next`, `@supabase/supabase-js`, `@supabase/ssr`.
 
+> **Peer-dep floor — `@supabase/ssr >= 0.10`.** The server handlers use the
+> `cookies.getAll()` / `cookies.setAll()` SSR cookie interface introduced in
+> `@supabase/ssr` 0.10. Apps still on an older `@supabase/ssr` **must bump to
+> `>= 0.10`** before adopting this package, or `handleReviewAccess` /
+> `handleReviewAuth` will fail to compile/run. (`peerDependencies` stays
+> permissive — `>=0.10.0 <1` — so the bump is on the consuming app; this note is
+> the heads-up.) The other peers — `react`/`react-dom` `>=18`, `next` `>=14`,
+> `@supabase/supabase-js` `^2` — match a current Next + Supabase app as-is.
+
 ## Config API
 
 Server entry points are parameterized with a single config object — no per-app
@@ -71,11 +80,32 @@ export type ReviewConfig = {
   landingPath?: string     // post-auth redirect. Default '/dashboard'.
   dashboardUrl?: string    // DRVR dashboard base URL. Default:
                            // process.env.REVIEW_DASHBOARD_URL || 'https://drvr-dashboard.fly.dev'
+
+  // --- Cross-site / landing options (handleReviewAccess only; all default off,
+  //     so apps that don't set them behave exactly as before) ---
+  markerCookie?: string    // if set, set `<name>=1` (SameSite=None; Secure; Path=/;
+                           // 8h) on the success redirect — the durable signal that
+                           // keeps an app's auth cookies cross-site-safe for the
+                           // rest of the reviewer session. e.g. 'wr_review'.
+  honorNext?: boolean      // default false. If true, redirect to a same-origin-safe
+                           // `?next=` param (guarded by normalizeReviewRedirectPath,
+                           // falling back to landingPath) instead of landingPath.
+  reappendToken?: boolean  // default false. If true, append review_token=<token> to
+                           // the success redirect so review mode stays on after landing.
 }
 ```
 
 `validateReviewToken(token, { project, dashboardUrl })` takes only the subset it
 needs; `handleReviewAccess` / `handleReviewAuth` take the full `ReviewConfig`.
+
+On the authenticated success redirect, `handleReviewAccess` computes the target
+as `honorNext && safe(next) ? next : landingPath` (the `next` param is run
+through `normalizeReviewRedirectPath`, which rejects `//host`, non-`/`, and bare
+`/`); appends `review_token` when `reappendToken`; and sets `markerCookie` when
+provided. The three options together reproduce the writing-room cross-site
+landing flow with `{ markerCookie: 'wr_review', honorNext: true, reappendToken: true }`.
+`handleReviewAccess` also always copies any auth cookies refreshed during the
+session check onto the redirect, so a token refresh mid-access survives.
 
 ## Environment variables
 
@@ -151,18 +181,30 @@ export default async function ReviewAuthPage({
 ```
 
 `app/review/error/page.tsx` and `app/review/expired/page.tsx` (terminal pages —
-re-export the components; keep the route paths so redirects don't 404):
+keep the route paths so redirects don't 404).
+
+Wrap the component in a local `Page` — do **not** use
+`export { ReviewErrorPage as default }`. A bare re-export trips Next's
+typed-routes `PageProps` constraint (the default export is checked against the
+generated page-props type, which the imported component's signature doesn't
+satisfy); a wrapper sidesteps it:
 
 ```tsx
 // app/review/error/page.tsx
-export { ReviewErrorPage as default } from '@drvr/review'
+import { ReviewErrorPage } from '@drvr/review'
 export const metadata = { title: 'Review session error' }
+export default function Page() {
+  return <ReviewErrorPage />
+}
 ```
 
 ```tsx
 // app/review/expired/page.tsx
-export { ReviewExpiredPage as default } from '@drvr/review'
+import { ReviewExpiredPage } from '@drvr/review'
 export const metadata = { title: 'Review link expired' }
+export default function Page() {
+  return <ReviewExpiredPage />
+}
 ```
 
 ### 2. Mount the bridge in the root layout
@@ -203,13 +245,59 @@ intercepted and surface the read-only toast; `shouldBlockSupabaseMutation`,
 `@drvr/review`) back that pattern, and `ReviewModeClient` shows the toast in
 response to the `review:readonly` event.
 
+**Automatic toast on blocked `fetch`.** `ReviewModeClient` ships a `fetch`
+interceptor that fires the read-only event for you whenever a response is the
+uniform reviewer-blocked 403 (`x-reviewer-read-only`). It's **on by default**
+(`interceptFetch`, only active inside a review session) — so once a server route
+returns `reviewerBlockedJsonResponse()`, the toast appears with no extra wiring.
+Pass `interceptFetch={false}` to opt out (e.g. you install your own).
+
+The interceptor is also exported standalone:
+
+```ts
+import {
+  installReviewBlockedFetchInterceptor,
+  isReviewerBlockedResponse,
+} from '@drvr/review'
+
+// Wrap window.fetch yourself; returns a cleanup that restores the original.
+const cleanup = installReviewBlockedFetchInterceptor() // defaults to window
+// ...later: cleanup()
+
+// Or test a single response:
+if (isReviewerBlockedResponse(res)) showMyOwnToast()
+```
+
+It wraps `fetch` non-destructively (passes the original Response/rejection
+straight through), is idempotent (double-install is a no-op), and SSR-safe
+(no-op when there's no `fetch`).
+
 ## Light theming (optional)
 
 The client components accept optional props so an app can rebrand without
-forking: `ReviewModeClient` (`bannerText`, `readOnlyToastText`,
-`bannerClassName`), `ReviewAuthClient` (`authPath`, `accessPath`,
-`accentClassName`), and the error/expired pages (`eyebrow`, `heading`, `body`).
-All default to the original copy/styling.
+forking. All default to the original copy/styling, and the class props are
+**full replacements** (not appended overrides) — so a brand style wins without
+fighting the defaults via `!important`.
+
+- **`ReviewModeClient`** — `bannerText`, `readOnlyToastText`, `interceptFetch`,
+  and `bannerClassName`. When `bannerClassName` is set it **replaces** the whole
+  default chip class string (the orange chip); leave it unset to keep the
+  default.
+- **`ReviewAuthClient`** — `authPath`, `accessPath`, plus two theming props:
+  - `accentClassName` **replaces** the default violet button accent
+    (`bg-violet-600 hover:bg-violet-700`) while keeping the structural button
+    classes — use this for a color-only rebrand.
+  - `buttonClassName` **replaces the entire** button `className` (structure +
+    accent), ignoring `accentClassName` — use this for total control.
+- **error / expired pages** — `eyebrow`, `heading`, `body`.
+
+```tsx
+// Color-only accent swap on the auth button:
+<ReviewAuthClient {...props} accentClassName="bg-emerald-600 hover:bg-emerald-700" />
+
+// Fully restyled review banner (replaces the default chip):
+<ReviewModeClient bannerClassName="rounded-md bg-black/80 px-2 py-1 text-xs text-white" />
+```
 
 ## Development
 

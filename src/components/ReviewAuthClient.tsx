@@ -14,10 +14,16 @@
  * Extracted from the `ember project bootstrap` scaffold into the
  * `@drvr/review` package. Styling uses Tailwind classes that work
  * out-of-the-box in any Next.js + Tailwind app. Optional props (`authPath`,
- * `accessPath`, `accentClassName`) let an app theme/rewire lightly without
- * forking; defaults reproduce the original behavior.
+ * `accessPath`, `accentClassName`, `buttonClassName`) let an app theme/rewire
+ * lightly without forking; defaults reproduce the original behavior.
  */
 import { useState } from 'react'
+
+/** Structural (non-accent) classes for the submit button. */
+const BUTTON_BASE_CLASS =
+  'w-full py-2.5 rounded-lg disabled:opacity-50 text-white font-medium text-sm transition-colors'
+/** Default accent (color) for the submit button. */
+const DEFAULT_ACCENT_CLASS = 'bg-violet-600 hover:bg-violet-700'
 
 export interface ReviewAuthClientProps {
   reviewToken: string
@@ -28,10 +34,20 @@ export interface ReviewAuthClientProps {
   /** Path the form navigates to on success. Default '/review/access'. */
   accessPath?: string
   /**
-   * Classes for the submit button + links, for light brand theming.
-   * Default reproduces the violet accent.
+   * Accent (color) classes for the submit button. When provided this
+   * **replaces** the default violet accent (it does not merge), so a brand
+   * color wins without `!important`. The structural button classes (width,
+   * padding, radius, disabled state) are kept; use `buttonClassName` to replace
+   * those too. Default: the original violet accent.
    */
   accentClassName?: string
+  /**
+   * Full override for the submit button's `className`. When provided this
+   * **replaces the entire** button class string (both structure and accent),
+   * ignoring `accentClassName`. Use this when you want total control of the
+   * button; otherwise prefer `accentClassName` for a color-only tweak.
+   */
+  buttonClassName?: string
 }
 
 type Mode = 'signin' | 'signup'
@@ -42,7 +58,8 @@ export default function ReviewAuthClient({
   projectName,
   authPath = '/api/review/auth',
   accessPath = '/review/access',
-  accentClassName = 'bg-violet-600 hover:bg-violet-700',
+  accentClassName = DEFAULT_ACCENT_CLASS,
+  buttonClassName,
 }: ReviewAuthClientProps) {
   const [mode, setMode] = useState<Mode>('signin')
   const [email, setEmail] = useState(clientEmail)
@@ -160,10 +177,7 @@ export default function ReviewAuthClient({
         <button
           type="submit"
           disabled={loading}
-          className={[
-            'w-full py-2.5 rounded-lg disabled:opacity-50 text-white font-medium text-sm transition-colors',
-            accentClassName,
-          ].join(' ')}
+          className={buttonClassName ?? `${BUTTON_BASE_CLASS} ${accentClassName}`}
         >
           {loading
             ? mode === 'signin' ? 'Signing in…' : 'Creating account…'
