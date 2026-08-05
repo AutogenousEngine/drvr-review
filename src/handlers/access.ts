@@ -80,8 +80,13 @@ export async function handleReviewAccess(
         getAll() { return request.cookies.getAll() },
         setAll(cookiesToSet) {
           response = NextResponse.next({ request })
-          cookiesToSet.forEach(({ name, value }) =>
-            response.cookies.set(name, value, reviewCookieOptions()),
+          // Merge, don't replace: supabase's own per-cookie attributes (maxAge,
+          // expires, domain) have to survive — dropping maxAge on a removal
+          // leaves an empty-valued cookie that never actually expires. The
+          // cross-site flags still win, since they're load-bearing for the
+          // iframe.
+          cookiesToSet.forEach(({ name, value, options }) =>
+            response.cookies.set(name, value, { ...options, ...reviewCookieOptions() }),
           )
         },
       },
@@ -93,8 +98,28 @@ export async function handleReviewAccess(
   // getUser() can rotate the refresh token; a redirect that drops the newly-set
   // cookie strands the browser holding an already-used refresh token, which
   // GoTrue revokes on next use — killing the session a different way.
+  //
+  // Session REMOVALS (empty value) are deliberately NOT carried. When getUser()
+  // hits a non-retryable refresh failure, auth-js calls _removeSession() and
+  // pushes `{ value: '', maxAge: 0 }` through setAll above. Copying that onto
+  // the redirect would actively WIPE the host browser's auth cookie — and the
+  // trigger is routine: the app tab rotates the refresh token, this iframe then
+  // loads holding the pre-rotation value (bfcache, background tab, partitioned
+  // cookie jar) past GoTrue's reuse grace window, GoTrue answers "Invalid
+  // Refresh Token: Already Used", and the wipe clobbers the good cookies the
+  // WINNING refresh just wrote. That is the same confused-deputy logout the
+  // signOut() removal below exists to prevent, via a different mechanism.
+  // Skipping the removal loses nothing: a genuinely dead cookie is still
+  // cleared on the pass-through path, where the supabase response is returned
+  // directly with its removals intact — and that is where these redirects land.
+  //
+  // Discriminate on cookie CONTENT, not on `user != null`: when the refresh
+  // SUCCEEDS but the follow-up /user request fails transiently, `user` is null
+  // while the rotated cookie is GOOD and must still be carried — which is
+  // exactly the stranding this helper exists to prevent.
   const withSessionCookies = (redirect: NextResponse) => {
     for (const cookie of response.cookies.getAll()) {
+      if (cookie.value === '') continue
       redirect.cookies.set(cookie)
     }
     return redirect

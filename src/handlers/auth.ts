@@ -78,8 +78,13 @@ export async function handleReviewAuth(
         getAll() { return request.cookies.getAll() },
         setAll(cookiesToSet) {
           response = NextResponse.json({ ok: true })
-          cookiesToSet.forEach(({ name, value }) =>
-            response.cookies.set(name, value, reviewCookieOptions()),
+          // Merge, don't replace: supabase's own per-cookie attributes (maxAge,
+          // expires, domain) have to survive — dropping maxAge on a removal
+          // leaves an empty-valued cookie that never actually expires. The
+          // cross-site flags still win, since they're load-bearing for the
+          // iframe.
+          cookiesToSet.forEach(({ name, value, options }) =>
+            response.cookies.set(name, value, { ...options, ...reviewCookieOptions() }),
           )
         },
       },
