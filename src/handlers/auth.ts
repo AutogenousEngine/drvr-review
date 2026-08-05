@@ -78,13 +78,19 @@ export async function handleReviewAuth(
         getAll() { return request.cookies.getAll() },
         setAll(cookiesToSet) {
           response = NextResponse.json({ ok: true })
-          // Merge, don't replace: supabase's own per-cookie attributes (maxAge,
-          // expires, domain) have to survive — dropping maxAge on a removal
-          // leaves an empty-valued cookie that never actually expires. The
-          // cross-site flags still win, since they're load-bearing for the
-          // iframe.
-          cookiesToSet.forEach(({ name, value, options }) =>
-            response.cookies.set(name, value, { ...options, ...reviewCookieOptions() }),
+          // reviewCookieOptions() sets no maxAge, so the reviewer's auth cookie
+          // stays BROWSER-SESSION scoped — it dies when the reviewer closes the
+          // browser. Do NOT spread supabase's own options in wholesale: those
+          // carry maxAge ≈ 400 days, which would silently convert a session
+          // cookie into a long-lived persistent credential on the reviewer's
+          // machine. The one attribute a removal genuinely needs is maxAge: 0,
+          // without which the browser never deletes the empty cookie.
+          cookiesToSet.forEach(({ name, value }) =>
+            response.cookies.set(name, value, {
+              ...reviewCookieOptions(),
+              // A removal must keep maxAge: 0 or the browser never deletes it.
+              ...(value === '' ? { maxAge: 0 } : {}),
+            }),
           )
         },
       },

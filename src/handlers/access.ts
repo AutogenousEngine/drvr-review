@@ -80,13 +80,19 @@ export async function handleReviewAccess(
         getAll() { return request.cookies.getAll() },
         setAll(cookiesToSet) {
           response = NextResponse.next({ request })
-          // Merge, don't replace: supabase's own per-cookie attributes (maxAge,
-          // expires, domain) have to survive — dropping maxAge on a removal
-          // leaves an empty-valued cookie that never actually expires. The
-          // cross-site flags still win, since they're load-bearing for the
-          // iframe.
-          cookiesToSet.forEach(({ name, value, options }) =>
-            response.cookies.set(name, value, { ...options, ...reviewCookieOptions() }),
+          // reviewCookieOptions() sets no maxAge, so the reviewer's auth cookie
+          // stays BROWSER-SESSION scoped — it dies when the reviewer closes the
+          // browser. Do NOT spread supabase's own options in wholesale: those
+          // carry maxAge ≈ 400 days, which would silently convert a session
+          // cookie into a long-lived persistent credential on the reviewer's
+          // machine. The one attribute a removal genuinely needs is maxAge: 0,
+          // without which the browser never deletes the empty cookie.
+          cookiesToSet.forEach(({ name, value }) =>
+            response.cookies.set(name, value, {
+              ...reviewCookieOptions(),
+              // A removal must keep maxAge: 0 or the browser never deletes it.
+              ...(value === '' ? { maxAge: 0 } : {}),
+            }),
           )
         },
       },
@@ -99,27 +105,48 @@ export async function handleReviewAccess(
   // cookie strands the browser holding an already-used refresh token, which
   // GoTrue revokes on next use — killing the session a different way.
   //
-  // Session REMOVALS (empty value) are deliberately NOT carried. When getUser()
-  // hits a non-retryable refresh failure, auth-js calls _removeSession() and
-  // pushes `{ value: '', maxAge: 0 }` through setAll above. Copying that onto
-  // the redirect would actively WIPE the host browser's auth cookie — and the
-  // trigger is routine: the app tab rotates the refresh token, this iframe then
-  // loads holding the pre-rotation value (bfcache, background tab, partitioned
-  // cookie jar) past GoTrue's reuse grace window, GoTrue answers "Invalid
-  // Refresh Token: Already Used", and the wipe clobbers the good cookies the
-  // WINNING refresh just wrote. That is the same confused-deputy logout the
-  // signOut() removal below exists to prevent, via a different mechanism.
-  // Skipping the removal loses nothing: a genuinely dead cookie is still
-  // cleared on the pass-through path, where the supabase response is returned
-  // directly with its removals intact — and that is where these redirects land.
+  // The decision is per BATCH, not per cookie. @supabase/ssr's
+  // applyServerStorage emits the SURPLUS CHUNK REMOVALS and the NEW chunks in
+  // the SAME setAll call. When a session's encoded size changes chunk count
+  // (3 chunks -> 2), the batch looks like:
   //
-  // Discriminate on cookie CONTENT, not on `user != null`: when the refresh
-  // SUCCEEDS but the follow-up /user request fails transiently, `user` is null
-  // while the rotated cookie is GOOD and must still be carried — which is
-  // exactly the stranding this helper exists to prevent.
+  //   [ { name: 'sb-x-auth-token.2', value: '',      options: { maxAge: 0 } },
+  //     { name: 'sb-x-auth-token.0', value: '<new>', options: {...} },
+  //     { name: 'sb-x-auth-token.1', value: '<new>', options: {...} } ]
+  //
+  // A per-cookie `value === ''` filter drops that `.2` cleanup and strands an
+  // orphan chunk. combineChunks() reads `.0`, `.1`, … in order and JOINS them,
+  // so the orphan is concatenated onto the new value and corrupts the session —
+  // a logout by another route. (The mirror case is just as bad: when the count
+  // grows, the batch removes the previously-UNCHUNKED `sb-x-auth-token`; drop
+  // that removal and combineChunks, which tries the unchunked name first,
+  // hands back the STALE pre-rotation session.) So a batch carrying ANY real
+  // value is a refresh/rebalance and is carried WHOLE, removals included.
+  //
+  // A batch that is ENTIRELY removals is a genuine session teardown, and that
+  // one is not carried. When getUser() hits a non-retryable refresh failure,
+  // auth-js calls _removeSession() and pushes only `{ value: '', maxAge: 0 }`
+  // entries through setAll above. Copying those onto the redirect would
+  // actively WIPE the host browser's auth cookie — and the trigger is routine:
+  // the app tab rotates the refresh token, this iframe then loads holding the
+  // pre-rotation value (bfcache, background tab, partitioned cookie jar) past
+  // GoTrue's reuse grace window, GoTrue answers "Invalid Refresh Token: Already
+  // Used", and the wipe clobbers the good cookies the WINNING refresh just
+  // wrote. That is the same confused-deputy logout the signOut() removal below
+  // exists to prevent, via a different mechanism. Declining the teardown costs
+  // nothing this context is entitled to do: the session belongs to the host
+  // browser, and if it really is dead the app's own Supabase client clears it
+  // on the very next request, where the removal is returned directly.
+  //
+  // Discriminate on the BATCH's content, not on `user != null`: when the
+  // refresh SUCCEEDS but the follow-up /user request fails transiently, `user`
+  // is null while the rotated cookie is GOOD and must still be carried — which
+  // is exactly the stranding this helper exists to prevent.
   const withSessionCookies = (redirect: NextResponse) => {
-    for (const cookie of response.cookies.getAll()) {
-      if (cookie.value === '') continue
+    const cookies = response.cookies.getAll()
+    const isTeardown = cookies.length > 0 && cookies.every((c) => c.value === '')
+    if (isTeardown) return redirect
+    for (const cookie of cookies) {
       redirect.cookies.set(cookie)
     }
     return redirect
