@@ -88,6 +88,18 @@ export async function handleReviewAccess(
     },
   )
 
+  // NextResponse.next() cookies don't transfer to a redirect, so carry any auth
+  // cookies refreshed during getUser() onto every redirect this handler returns.
+  // getUser() can rotate the refresh token; a redirect that drops the newly-set
+  // cookie strands the browser holding an already-used refresh token, which
+  // GoTrue revokes on next use — killing the session a different way.
+  const withSessionCookies = (redirect: NextResponse) => {
+    for (const cookie of response.cookies.getAll()) {
+      redirect.cookies.set(cookie)
+    }
+    return redirect
+  }
+
   const { data: { user } } = await supabase.auth.getUser()
 
   if (user) {
@@ -113,12 +125,7 @@ export async function handleReviewAccess(
         ? appendReviewToken(target, token, origin, landingPath)
         : new URL(target, origin)
 
-      const redirectResponse = NextResponse.redirect(destination)
-      // NextResponse.next() cookies don't transfer to a redirect — copy any
-      // auth cookies refreshed during getUser onto the redirect response.
-      for (const cookie of response.cookies.getAll()) {
-        redirectResponse.cookies.set(cookie)
-      }
+      const redirectResponse = withSessionCookies(NextResponse.redirect(destination))
       // Durable cross-site marker so the app's Supabase clients keep emitting
       // SameSite=None auth cookies for the rest of this reviewer session.
       if (config.markerCookie) {
@@ -134,11 +141,25 @@ export async function handleReviewAccess(
       }
       return redirectResponse
     }
-    // Wrong email — sign out and fall through to auth page.
-    await supabase.auth.signOut()
+    // Wrong email — fall through to the auth page.
+    //
+    // Deliberately NO signOut() here (2026-08-05 confused-deputy logout
+    // incident). This handler runs server-side inside a cross-site review
+    // iframe that carries the HOST BROWSER's cookies, so the session it sees
+    // belongs to whoever is signed in to the app in that browser — not to the
+    // review flow. supabase-js signOut() defaults to scope 'global', revoking
+    // that user's sessions on every device, so every dashboard iframe load
+    // minted for a different email silently logged the real user out
+    // everywhere. This context does not own the session, so it must destroy
+    // nothing — not even scope 'local'. Nothing needs destroying anyway:
+    // signing in at /review/auth (POST /api/review/auth → signInWithPassword)
+    // replaces the session in this context.
+    //
+    // The email gate is unchanged: a mismatched user still gets no review
+    // access, they just fall through to /review/auth as before.
   }
 
   const authUrl = new URL('/review/auth', getExternalOrigin(request))
   authUrl.searchParams.set('review_token', token)
-  return NextResponse.redirect(authUrl)
+  return withSessionCookies(NextResponse.redirect(authUrl))
 }
